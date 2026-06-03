@@ -390,3 +390,84 @@ RETURNING id, type, title, body, data, read, created_at;
 ```
 
 Push the returned row to the client over WebSocket, then run the unread count query if you send `notification.unread_count`.
+
+---
+
+# Stage 3
+
+## Is the query accurate?
+
+Yes, for "give me every unread row for this student, oldest first." The filters are correct.
+
+What's off for a real API:
+
+- `SELECT *` pulls columns you may not need (bigger reads, more memory).
+- No `LIMIT` / pagination. A student with thousands of unread rows returns all of them in one shot.
+- `ORDER BY createdAt ASC` is valid but most inboxes show newest first (`DESC`). Only wrong if product wants oldest on top.
+
+---
+
+## Why is it slow?
+
+You have ~5M rows across 50k students. Without a good index, the database scans a huge slice of the table to find `studentID = 1042 AND isRead = false`, then sorts the matches.
+
+Even with an index on `studentID` only, you still filter `isRead` and sort by `createdAt` as extra work. `SELECT *` makes each matched row heavier.
+
+One active student with many unread rows makes the sort step costly.
+
+---
+
+## What I would change
+
+**Query:**
+
+```sql
+SELECT id, notificationType, title, body, createdAt
+FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt DESC
+LIMIT 20 OFFSET 0;
+```
+
+**Index (partial, matches the filter):**
+
+```sql
+CREATE INDEX idx_notifications_student_unread_created
+ON notifications (studentID, createdAt DESC)
+WHERE isRead = false;
+```
+
+**Likely cost after fix:**
+
+- Before: often O(n) table or large index scan on millions of rows, plus sort on many rows.
+- After: O(log n) index seek on `studentID` within the partial index, then read only unread rows for that student, sort a smaller set (or avoid big sort if the index order matches). With `LIMIT 20`, work is roughly O(log n + 20).
+
+---
+
+## Index on every column?
+
+No. Bad default advice.
+
+- Writes get slower (every insert/update touches many indexes).
+- Disk and memory go up for little gain.
+- The planner can pick a worse index when many overlap.
+
+Index columns (or small combinations) that match real `WHERE`, `JOIN`, and `ORDER BY` patterns. Here: `studentID`, `isRead`, `createdAt`, and sometimes `notificationType` for reporting queries.
+
+---
+
+## Students with a Placement notification in the last 7 days
+
+```sql
+SELECT DISTINCT studentID
+FROM notifications
+WHERE notificationType = 'Placement'
+  AND createdAt >= NOW() - INTERVAL '7 days';
+```
+
+If this runs often, add:
+
+```sql
+CREATE INDEX idx_notifications_type_created
+ON notifications (notificationType, createdAt DESC);
+```
