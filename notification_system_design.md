@@ -293,14 +293,6 @@ CREATE INDEX idx_notifications_user_unread
 | Old notifications | Storage cost keeps rising                        |
 
 
-**Fixes:**
-
-- Keep pagination on list (already in Stage 1 API)
-- Indexes above for `user_id + created_at` and unread filter
-- Archive or delete notifications older than 90 days (cron job moves to `notifications_archive` or hard delete)
-- For mark-all-read, update in batches if needed
-- Optional: cache unread count in Redis per user, refresh on write
-
 ---
 
 ## Queries (mapped to Stage 1 APIs)
@@ -471,3 +463,163 @@ If this runs often, add:
 CREATE INDEX idx_notifications_type_created
 ON notifications (notificationType, createdAt DESC);
 ```
+
+---
+
+# Stage 4
+
+## What I would do ?
+
+### 1. Stop loading notifications on every page
+
+Only fetch when the user opens the bell dropdown or the notifications page. Other pages show just the unread badge if needed.
+
+**Tradeoff:** Less DB load and faster pages. Badge count still needs one light call unless you cache it (see below).
+
+---
+
+### 2. Cache per student (Redis)
+
+Store unread count and the latest N notifications (e.g. 20) keyed by `studentID`. On read, serve from cache. On new notification / mark read / delete, update or invalidate cache.
+
+**Tradeoff:** Big drop in DB reads. You add Redis ops and must handle stale data if invalidation is wrong. Short TTL (30-60s) reduces risk.
+
+---
+
+### 3. Use WebSocket (already in Stage 1) instead of re-fetching
+
+After login, connect once. New notifications push to the client. Update local state. Do not re-query the DB on each route change.
+
+**Tradeoff:** Live updates without polling. More moving parts (connection drops, reconnect, auth on WS). Still need a one-time or occasional REST fetch to sync after offline.
+
+---
+
+### 4. Client-side cache (React Query / SWR)
+
+Cache API responses in the browser for a few minutes. `staleTime` so navigating between pages does not refetch.
+
+**Tradeoff:** Free reduction in duplicate calls. User on another device or tab may see old data until refresh or WS event.
+
+---
+
+# Stage 5
+
+## Shortcomings of the original approach
+
+- **Sequential loop:** 50,000 students one by one. HR waits forever. One slow email blocks everyone behind it.
+- **No idempotency:** Click "Notify All" twice and students get duplicates.
+- **All or nothing mindset:** If `send_email` fails at student 25,001, you have no clear record of who succeeded. In-app and DB may be ahead of email or behind.
+- **Tight coupling:** Email, DB, and push in one loop. One channel failing does not mean you should skip or roll back the others blindly, but the code gives you no per-student status.
+- **No retries:** Transient SMTP errors lose those students unless someone runs it again manually.
+- **Single process:** No queue, no workers, no rate limit. Email provider may throttle or ban you.
+
+---
+
+## send_email failed for 200 students midway. What now?
+
+With the original code you cannot tell easily:
+
+- Which 200 failed (unless you logged each `student_id`).
+- Whether DB save and push already ran for those 200
+
+---
+
+## Should DB save and email happen together?
+
+**No, not in one synchronous step.**
+
+They are different systems with different failure modes. Tie them in one function and a slow or down email API blocks DB writes for everyone, or a DB outage blocks email for everyone.
+
+**Better pattern:**
+
+1. Record the campaign and enqueue one job per student (or per batch).
+2. Workers handle email, DB insert, and push as separate steps with retries.
+3. Student still gets in-app notification even if email is delayed. Email can retry without re-inserting the row if you use idempotency keys.
+
+---
+
+## Revised pseudocode
+
+```
+function notify_all(student_ids, message, campaign_id):
+    create_campaign(campaign_id, message, total = len(student_ids))
+
+    for batch in chunk(student_ids, size=500):
+        enqueue_jobs(campaign_id, batch, message)
+
+    return { campaign_id, status: "queued" }
+
+
+worker_process(job):
+    if job_already_done(job.idempotency_key):
+        return
+
+    # in-app first: user sees it even if email lags
+    save_to_db(job.student_id, job.message, job.campaign_id)
+    mark(job, "db_saved")
+
+    push_to_app(job.student_id, job.message)
+    mark(job, "pushed")
+
+    try:
+        send_email(job.student_id, job.message)
+        mark(job, "email_sent")
+    catch error:
+        mark(job, "email_failed", error)
+        schedule_retry(job, backoff)   # max 3 attempts
+        if retries_exhausted(job):
+            move_to_dead_letter(job)
+            alert_ops(job.student_id)
+
+    mark_campaign_progress(job.campaign_id)
+
+
+function retry_failed_emails(campaign_id):
+    for job in get_jobs(campaign_id, status="email_failed", retries_left):
+        worker_process(job)   # skips db/push if already done via idempotency_key
+```
+
+**Flow in plain terms:**
+
+1. HR clicks Notify All. Server creates a campaign and pushes 100 batch jobs (500 students each) to a queue. HR gets `queued` immediately.
+2. Many workers run in parallel (respect email rate limits).
+3. Each student: DB + push first, then email with retry.
+4. 200 email failures: stay marked `email_failed`, retry worker or `retry_failed_emails` without touching students who already have in-app.
+5. Admin dashboard reads campaign status from job table.
+
+---
+
+# Stage 6
+
+## Code
+
+`priority_inbox/priority_inbox.mjs`
+
+- Fetches from `GET /evaluation-service/notifications`
+- Inserts each notification into a size-10 min-heap
+- Prints the top 10 sorted for display
+
+Run:
+
+```bash
+set EVALUATION_SERVICE_TOKEN=your_token
+node priority_inbox/priority_inbox.mjs
+```
+
+Screenshots go in `priority_inbox/screenshots/`.
+
+---
+
+## Keeping top N efficient as new items arrive
+
+Do not re-sort the full list on every new notification.
+
+Use a **min-heap of size N**:
+
+- Heap stores the current top N by score.
+- The root is the weakest among those N.
+- New notification: if its score beats the root, replace the root (`heapreplace`).
+- Cost per insert: O(log N). For N=10 that is effectively constant.
+
+On each WebSocket `notification.created`, call `inbox.add(row)` and refresh the UI from `inbox.top()`.
+
